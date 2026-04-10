@@ -9,8 +9,10 @@ Receives Range Image Protocol (RIP2) packets over UDP and publishes PointCloud2,
 depth images, and intensity images.
 """
 
-import struct
+import math
+import socket
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -18,7 +20,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Header
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 
@@ -39,13 +41,26 @@ class SonarNode(Node):
         self._recv_thread: Optional[threading.Thread] = None
         self._running = False
 
+        # Packet statistics (written by recv thread, read by heartbeat timer)
+        self._lock = threading.Lock()
+        self._stats_udp_packets = 0
+        self._stats_range_images = 0
+        self._stats_bitmap_images = 0
+        self._stats_unknown_packets = 0
+        self._stats_decode_errors = 0
+        self._stats_timeouts = 0
+        self._stats_last_seq_id = -1
+        self._stats_start_time = time.monotonic()
+
         self._pub_point_cloud = self.create_publisher(PointCloud2, '~/point_cloud', 10)
         self._pub_range_image = self.create_publisher(Image, '~/range_image', 10)
         self._pub_intensity_image = self.create_publisher(Image, '~/intensity_image', 10)
+        self._pub_camera_info = self.create_publisher(CameraInfo, '~/camera_info', 10)
         self._pub_diagnostics = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         diag_period = self.get_parameter('diagnostics_period').get_parameter_value().double_value
         self._diag_timer = self.create_timer(diag_period, self._diagnostics_callback)
+        self._heartbeat_timer = self.create_timer(1.0, self._heartbeat_callback)
 
         self.add_on_set_parameters_callback(self._on_parameter_change)
 
@@ -89,6 +104,10 @@ class SonarNode(Node):
         self.declare_parameter('unicast_destination_port', 0, ParameterDescriptor(
             type=ParameterType.PARAMETER_INTEGER,
             description='Unicast destination port (only used when udp_mode is "unicast")'))
+        self.declare_parameter('interface_ip', '0.0.0.0', ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description='Local IP of the network interface to use for multicast/unicast bind. '
+                        'Set to the IP on the same subnet as the sonar on multi-homed machines.'))
         self.declare_parameter('diagnostics_period', 5.0, ParameterDescriptor(
             type=ParameterType.PARAMETER_DOUBLE,
             description='Period in seconds between diagnostic queries'))
@@ -218,18 +237,22 @@ class SonarNode(Node):
 
     def _open_udp_and_start_receiver(self):
         udp_mode = self.get_parameter('udp_mode').get_parameter_value().string_value
+        iface_ip = self.get_parameter('interface_ip').get_parameter_value().string_value
 
         try:
             if udp_mode == 'unicast':
                 uport = self.get_parameter(
                     'unicast_destination_port').get_parameter_value().integer_value
-                self._udp_sock = wlsonar.open_sonar_udp_unicast_socket(udp_port=uport)
-                self.get_logger().info(f'UDP unicast socket listening on port {uport}')
+                self._udp_sock = wlsonar.open_sonar_udp_unicast_socket(
+                    udp_port=uport, iface_ip=iface_ip)
+                self.get_logger().info(
+                    f'UDP unicast socket listening on {iface_ip}:{uport}')
             else:
-                self._udp_sock = wlsonar.open_sonar_udp_multicast_socket()
+                self._udp_sock = wlsonar.open_sonar_udp_multicast_socket(
+                    iface_ip=iface_ip)
                 self.get_logger().info(
                     f'UDP multicast socket joined {wlsonar.DEFAULT_MCAST_GRP}'
-                    f':{wlsonar.DEFAULT_MCAST_PORT}')
+                    f':{wlsonar.DEFAULT_MCAST_PORT} on interface {iface_ip}')
         except Exception as e:
             self.get_logger().error(f'Failed to open UDP socket: {e}')
             return
@@ -242,32 +265,82 @@ class SonarNode(Node):
 
     def _udp_receive_loop(self):
         frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        local_pkt_count = 0
+        local_timeout_count = 0
 
         while self._running and rclpy.ok():
             try:
-                data, _addr = self._udp_sock.recvfrom(wlsonar.UDP_MAX_DATAGRAM_SIZE)
-            except TimeoutError:
+                data, addr = self._udp_sock.recvfrom(wlsonar.UDP_MAX_DATAGRAM_SIZE)
+            except (TimeoutError, socket.timeout):
+                local_timeout_count += 1
+                with self._lock:
+                    self._stats_timeouts = local_timeout_count
+                if local_timeout_count % 5 == 1:
+                    self.get_logger().warn(
+                        f'No UDP packets received (timeouts: {local_timeout_count}, '
+                        f'packets so far: {local_pkt_count})')
                 continue
-            except OSError:
+            except OSError as e:
                 if self._running:
-                    self.get_logger().error('UDP socket error, stopping receiver')
+                    self.get_logger().error(f'UDP socket error: {e}')
                 break
+
+            local_pkt_count += 1
+            with self._lock:
+                self._stats_udp_packets = local_pkt_count
+            if local_pkt_count == 1:
+                self.get_logger().info(
+                    f'First UDP packet from {addr[0]}:{addr[1]} ({len(data)} bytes)')
 
             try:
                 msg = rip.unpackb(data)
             except rip.UnknownProtobufTypeError:
+                with self._lock:
+                    self._stats_unknown_packets += 1
+                    count = self._stats_unknown_packets
+                if count <= 3 or count % 100 == 0:
+                    self.get_logger().debug(
+                        f'Unknown protobuf type (count: {count}, '
+                        f'size: {len(data)} bytes)')
                 continue
             except (rip.CRCMismatchError, rip.BadIDError, rip.ExtraDataError) as e:
+                with self._lock:
+                    self._stats_decode_errors += 1
                 self.get_logger().warn(f'Packet decode error: {e}')
+                continue
+            except Exception as e:
+                with self._lock:
+                    self._stats_decode_errors += 1
+                self.get_logger().warn(f'Unexpected decode error: {type(e).__name__}: {e}')
                 continue
 
             stamp = self.get_clock().now().to_msg()
             header = Header(stamp=stamp, frame_id=frame_id)
 
             if isinstance(msg, rip.RangeImage):
+                with self._lock:
+                    self._stats_range_images += 1
+                    self._stats_last_seq_id = msg.header.sequence_id
+                    ri_count = self._stats_range_images
+                if ri_count <= 3:
+                    self.get_logger().info(
+                        f'RangeImage: {msg.width}x{msg.height}, '
+                        f'freq={msg.frequency}Hz, '
+                        f'seq={msg.header.sequence_id}')
+                self._publish_camera_info(msg, header)
                 self._publish_range_image(msg, header)
                 self._publish_point_cloud(msg, header)
             elif isinstance(msg, rip.BitmapImageGreyscale8):
+                with self._lock:
+                    self._stats_bitmap_images += 1
+                    self._stats_last_seq_id = msg.header.sequence_id
+                    bmp_count = self._stats_bitmap_images
+                if bmp_count <= 3:
+                    self.get_logger().info(
+                        f'BitmapImage: {msg.width}x{msg.height}, '
+                        f'freq={msg.frequency}Hz, '
+                        f'seq={msg.header.sequence_id}')
+                self._publish_camera_info(msg, header)
                 self._publish_intensity_image(msg, header)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -343,8 +416,98 @@ class SonarNode(Node):
 
         self._pub_point_cloud.publish(cloud)
 
+    def _publish_camera_info(self, msg, header: Header):
+        """Publish sonar intrinsics as CameraInfo alongside each image.
+
+        Encodes the sonar's angular FOV as a pinhole-equivalent projection so
+        that standard ROS tools can relate pixel coordinates to bearing angles.
+        The K matrix maps (azimuth_px, elevation_px) → bearing in the same way
+        a pinhole camera maps (u, v) → ray direction.
+        """
+        if self._pub_camera_info.get_subscription_count() == 0:
+            return
+
+        fov_h_rad = math.radians(msg.fov_horizontal)
+        fov_v_rad = math.radians(msg.fov_vertical)
+
+        # Pinhole-equivalent focal lengths (pixels)
+        fx = (msg.width / 2.0) / math.tan(fov_h_rad / 2.0) if fov_h_rad > 0 else 0.0
+        fy = (msg.height / 2.0) / math.tan(fov_v_rad / 2.0) if fov_v_rad > 0 else 0.0
+        cx = msg.width / 2.0
+        cy = msg.height / 2.0
+
+        ci = CameraInfo()
+        ci.header = header
+        ci.width = msg.width
+        ci.height = msg.height
+        ci.distortion_model = 'none'
+        ci.d = []
+        ci.k = [fx, 0.0, cx,
+                0.0, fy, cy,
+                0.0, 0.0, 1.0]
+        ci.r = [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+        ci.p = [fx, 0.0, cx, 0.0,
+                0.0, fy, cy, 0.0,
+                0.0, 0.0, 1.0, 0.0]
+
+        self._pub_camera_info.publish(ci)
+
     # ──────────────────────────────────────────────────────────────────────
-    # Diagnostics
+    # Heartbeat
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _heartbeat_callback(self):
+        """Publish a periodic DiagnosticStatus with packet receive statistics."""
+        with self._lock:
+            udp_pkts = self._stats_udp_packets
+            range_imgs = self._stats_range_images
+            bitmap_imgs = self._stats_bitmap_images
+            unknown = self._stats_unknown_packets
+            decode_err = self._stats_decode_errors
+            timeouts = self._stats_timeouts
+            last_seq = self._stats_last_seq_id
+
+        elapsed = time.monotonic() - self._stats_start_time
+
+        diag_array = DiagnosticArray()
+        diag_array.header.stamp = self.get_clock().now().to_msg()
+
+        status = DiagnosticStatus()
+        status.name = 'Sonar 3D-15 Receiver'
+        status.hardware_id = self.get_parameter('sonar_ip').get_parameter_value().string_value
+
+        receiving = udp_pkts > 0 and timeouts < 3
+        if self._recv_thread is None or not self._recv_thread.is_alive():
+            status.level = DiagnosticStatus.ERROR
+            status.message = 'Receiver thread not running'
+        elif not receiving and elapsed > 10.0:
+            status.level = DiagnosticStatus.WARN
+            status.message = f'No data (timeouts: {timeouts})'
+        elif udp_pkts > 0 and range_imgs == 0 and bitmap_imgs == 0:
+            status.level = DiagnosticStatus.WARN
+            status.message = f'Packets received but none decoded ({unknown} unknown)'
+        else:
+            status.level = DiagnosticStatus.OK
+            status.message = f'Receiving ({range_imgs} range, {bitmap_imgs} bitmap images)'
+
+        status.values = [
+            KeyValue(key='udp_packets_total', value=str(udp_pkts)),
+            KeyValue(key='range_images', value=str(range_imgs)),
+            KeyValue(key='bitmap_images', value=str(bitmap_imgs)),
+            KeyValue(key='unknown_packets', value=str(unknown)),
+            KeyValue(key='decode_errors', value=str(decode_err)),
+            KeyValue(key='timeouts', value=str(timeouts)),
+            KeyValue(key='last_sequence_id', value=str(last_seq)),
+            KeyValue(key='uptime_s', value=f'{elapsed:.1f}'),
+        ]
+
+        diag_array.status.append(status)
+        self._pub_diagnostics.publish(diag_array)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Diagnostics (sonar hardware)
     # ──────────────────────────────────────────────────────────────────────
 
     def _diagnostics_callback(self):
