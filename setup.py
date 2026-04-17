@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'waterlinked_sonar_3d15'
@@ -9,8 +12,8 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/sonar_3d15.launch.py']),
-        ('share/' + package_name + '/config', ['config/default_params.yaml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=[
         'setuptools',
@@ -26,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sonar_node = waterlinked_sonar_3d15.sonar_node:main',
+            'sonar_diag = waterlinked_sonar_3d15.sonar_diag:main',
         ],
     },
 )

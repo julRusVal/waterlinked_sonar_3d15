@@ -52,10 +52,18 @@ class SonarNode(Node):
         self._stats_last_seq_id = -1
         self._stats_start_time = time.monotonic()
 
-        self._pub_point_cloud = self.create_publisher(PointCloud2, '~/point_cloud', 10)
-        self._pub_range_image = self.create_publisher(Image, '~/range_image', 10)
-        self._pub_intensity_image = self.create_publisher(Image, '~/intensity_image', 10)
-        self._pub_camera_info = self.create_publisher(CameraInfo, '~/camera_info', 10)
+        self._pub_point_cloud = self.create_publisher(
+            PointCloud2,
+            self.get_parameter('topic_point_cloud').get_parameter_value().string_value, 10)
+        self._pub_range_image = self.create_publisher(
+            Image,
+            self.get_parameter('topic_range_image').get_parameter_value().string_value, 10)
+        self._pub_intensity_image = self.create_publisher(
+            Image,
+            self.get_parameter('topic_intensity_image').get_parameter_value().string_value, 10)
+        self._pub_camera_info = self.create_publisher(
+            CameraInfo,
+            self.get_parameter('topic_camera_info').get_parameter_value().string_value, 10)
         self._pub_diagnostics = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         diag_period = self.get_parameter('diagnostics_period').get_parameter_value().double_value
@@ -111,6 +119,19 @@ class SonarNode(Node):
         self.declare_parameter('diagnostics_period', 5.0, ParameterDescriptor(
             type=ParameterType.PARAMETER_DOUBLE,
             description='Period in seconds between diagnostic queries'))
+
+        self.declare_parameter('topic_point_cloud', '~/point_cloud', ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description='Topic name for PointCloud2 output'))
+        self.declare_parameter('topic_range_image', '~/range_image', ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description='Topic name for range image output'))
+        self.declare_parameter('topic_intensity_image', '~/intensity_image', ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description='Topic name for intensity image output'))
+        self.declare_parameter('topic_camera_info', '~/camera_info', ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description='Topic name for CameraInfo output'))
 
     def _on_parameter_change(self, params: list[Parameter]) -> SetParametersResult:
         for param in params:

@@ -65,7 +65,10 @@ ros2 run waterlinked_sonar_3d15 sonar_node --ros-args \
 | `~/point_cloud` | `sensor_msgs/PointCloud2` | XYZ point cloud from range images |
 | `~/range_image` | `sensor_msgs/Image` (32FC1) | Range image as float32 distances in meters |
 | `~/intensity_image` | `sensor_msgs/Image` (8UC1) | Logarithmic signal strength image |
+| `~/camera_info` | `sensor_msgs/CameraInfo` | Sonar lens model (pinhole projection) |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Temperature, firmware, system status |
+
+Topic names are configurable via the `topic_*` parameters (see below). The defaults above use the `~/` prefix, which resolves relative to the node name.
 
 ## Parameters
 
@@ -80,34 +83,120 @@ ros2 run waterlinked_sonar_3d15 sonar_node --ros-args \
 | `range_min` | double | `0.3` | Minimum imaging range in meters |
 | `range_max` | double | `15.0` | Maximum imaging range in meters |
 | `udp_mode` | string | `multicast` | `multicast` or `unicast` |
+| `interface_ip` | string | `0.0.0.0` | Local IP for multicast join / unicast bind |
 | `unicast_destination_ip` | string | `""` | Unicast destination IP |
 | `unicast_destination_port` | int | `0` | Unicast destination port |
+| `topic_point_cloud` | string | `~/point_cloud` | Topic name for PointCloud2 output |
+| `topic_range_image` | string | `~/range_image` | Topic name for range image output |
+| `topic_intensity_image` | string | `~/intensity_image` | Topic name for intensity image output |
+| `topic_camera_info` | string | `~/camera_info` | Topic name for CameraInfo output |
 | `diagnostics_period` | double | `5.0` | Seconds between diagnostic queries |
 
-Parameters `acoustics_enabled`, `speed_of_sound`, `mode`, `salinity`, `range_min`, and `range_max` can be changed at runtime via `ros2 param set`.
+### Changing parameters at runtime
+
+The following parameters can be changed while the node is running using `ros2 param set`:
+
+| Parameter | Example value | Notes |
+|---|---|---|
+| `acoustics_enabled` | `true` / `false` | Turns acoustic imaging on or off |
+| `speed_of_sound` | `1500.0` | Adjust for water conditions (m/s) |
+| `mode` | `low-frequency` / `high-frequency` | Requires firmware >= 1.7.0 |
+| `salinity` | `salt` / `fresh` | Requires firmware >= 1.7.0 |
+| `range_min` | `0.5` | Minimum imaging range (meters) |
+| `range_max` | `10.0` | Maximum imaging range (meters) |
+
+First, find the node name:
+
+```bash
+ros2 node list
+```
+
+Then set any parameter (replace `<node_name>` with the result above, e.g. `/sonar_node`):
+
+```bash
+ros2 param set <node_name> mode high-frequency
+ros2 param set <node_name> range_max 10.0
+ros2 param set <node_name> acoustics_enabled false
+```
+
+You can also inspect the current value of any parameter:
+
+```bash
+ros2 param get <node_name> mode
+```
+
+All other parameters (`sonar_ip`, `frame_id`, `udp_mode`, `interface_ip`, `unicast_destination_ip`, `unicast_destination_port`, `topic_*`, `diagnostics_period`) are read-only after startup and require a node restart to change.
 
 ## Architecture
 
+```mermaid
+graph TD
+    subgraph sonar_node
+        A[wlsonar.Sonar3D] -- "HTTP config" --> B[Sonar 3D-15]
+        B -- "HTTP response" --> A
+        B -- "UDP / RIP2" --> C[recv thread]
+        C -- "wlsonar.range_image_protocol.unpackb()" --> D[PointCloud2 publisher]
+        C -- "wlsonar.range_image_protocol.unpackb()" --> E[range_image publisher]
+        C -- "wlsonar.range_image_protocol.unpackb()" --> F[intensity publisher]
+    end
 ```
-┌──────────────────────────────────────────────────┐
-│ sonar_node                                       │
-│                                                  │
-│  ┌────────────┐    HTTP     ┌──────────────┐     │
-│  │ wlsonar    │────────────▶│ Sonar 3D-15  │     │
-│  │ .Sonar3D   │◀────────────│              │     │
-│  └────────────┘             │              │     │
-│                    UDP/RIP2 │              │     │
-│  ┌────────────┐◀────────────│              │     │
-│  │ recv thread│             └──────────────┘     │
-│  └─────┬──────┘                                  │
-│        │ wlsonar.range_image_protocol.unpackb()  │
-│        ▼                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────┐ │
-│  │PointCloud2  │  │ range_image  │  │intensity│ │
-│  │ publisher   │  │ publisher    │  │publisher│ │
-│  └─────────────┘  └──────────────┘  └─────────┘ │
-└──────────────────────────────────────────────────┘
+
+## Diagnostics Tool
+
+The package includes a standalone diagnostics node (`sonar_diag`) for benchmarking the sonar.
+
+### Launch with parameters file
+
+```bash
+ros2 launch waterlinked_sonar_3d15 sonar_diag.launch.py
+# or with a custom params file:
+ros2 launch waterlinked_sonar_3d15 sonar_diag.launch.py params_file:=/path/to/diag_params.yaml
 ```
+
+### Continuous monitoring
+
+Prints live data rates and range/intensity image timing offsets every second:
+
+```bash
+ros2 run waterlinked_sonar_3d15 sonar_diag --ros-args \
+    -p sonar_ip:=192.168.2.190 \
+    -p interface_ip:=192.168.2.1
+```
+
+Example output:
+
+```
+[INFO] --- Sonar Diagnostics ---
+[INFO]   RangeImage:  4.2 Hz  (seq 1042, 150x16, freq 750000 Hz)
+[INFO]   BitmapImage: 4.1 Hz  (seq 1042, 150x16, freq 750000 Hz)
+[INFO]   RI-BI offset: 12.3 ms avg (last 10 pairs)
+```
+
+### Mode-switch latency test
+
+Measures how long it takes to switch between low-frequency and high-frequency modes, and how long until data resumes after each switch:
+
+```bash
+ros2 run waterlinked_sonar_3d15 sonar_diag --ros-args \
+    -p sonar_ip:=192.168.2.190 \
+    -p interface_ip:=192.168.2.1 \
+    -p test_switch:=true \
+    -p cycles:=3
+```
+
+Reports API call latency, data blackout duration, and confirms the resolution changed by logging the first image dimensions after each switch.
+
+### Diagnostics parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `sonar_ip` | string | `192.168.194.96` | IP address of the Sonar 3D-15 |
+| `udp_mode` | string | `multicast` | `multicast` or `unicast` |
+| `interface_ip` | string | `0.0.0.0` | Local interface IP for socket bind |
+| `unicast_destination_ip` | string | `""` | Unicast destination IP |
+| `unicast_destination_port` | int | `0` | Unicast destination port |
+| `test_switch` | bool | `false` | Run mode-switch test instead of monitoring |
+| `cycles` | int | `3` | Number of switch cycles for the test |
 
 ## Sonar Modes
 

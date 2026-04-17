@@ -1,6 +1,6 @@
 sonar_node:
   ros__parameters:
-    sonar_ip: "192.168.2.190" # "192.168.194.96"
+    sonar_ip: "192.168.32.109" # "192.168.194.96"
     frame_id: "sonar_link"
 
     # Acoustics
@@ -18,9 +18,9 @@ sonar_node:
     udp_mode: "unicast"
     # Local interface IP for multicast join / unicast bind.
     # Set to the IP on the same subnet as the sonar on multi-homed machines.
-    interface_ip: "192.168.2.1"
+    interface_ip: "192.168.32.190"
     # Unicast: sonar sends UDP to this IP:port (must be reachable from sonar)
-    unicast_destination_ip: "192.168.2.1"
+    unicast_destination_ip: "192.168.32.190"
     unicast_destination_port: 4747
 
     # Topic names (use ~/ prefix for node-relative, or absolute like /sonar/points)
