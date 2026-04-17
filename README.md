@@ -202,12 +202,10 @@ Reports API call latency, data blackout duration, and confirms the resolution ch
 
 The Sonar 3D-15 (firmware >= 1.7.0) supports two imaging modes:
 
-| Mode | Horizontal Res | Vertical Res | Image Size |
-|---|---|---|---|
-| `low-frequency` | 0.6° (150 px) | 2.4° (16 px) | 2400 pixels |
-| `high-frequency` | 0.4° (225 px) | 1.1° (36 px) | 8100 pixels |
-
-Both modes have 90° horizontal and 40° vertical FOV.
+| | Low-frequency (1.2 MHz) | High-frequency (2.4 MHz) |
+|---|---|---|
+| **Field of View** | H 90° x V 40° | H 40° x V 40° |
+| **Beam angle** | H 0.85° x V 1.60° | H 0.45° x V 0.85° |
 
 ## License
 
