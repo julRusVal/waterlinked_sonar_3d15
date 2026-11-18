@@ -49,6 +49,16 @@ ros2 launch waterlinked_sonar_3d15 sonar_3d15.launch.py \
     params_file:=/path/to/your_params.yaml
 ```
 
+### Replay from a .sonar file
+
+```bash
+ros2 run waterlinked_sonar_3d15 sonar_node --ros-args \
+    -p sonar_file:=/path/to/recording.sonar
+```
+
+When `sonar_file` is set, the node does not connect to the sonar over HTTP/UDP and instead reads packets from the file.
+Replay is paced in real time using the recorded message timestamp deltas.
+
 ### Run the node directly
 
 ```bash
@@ -84,6 +94,8 @@ of the sonar's uniformly spaced yaw/pitch samples; corners can differ.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `sonar_ip` | string | `192.168.194.96` | IP address of the Sonar 3D-15 |
+| `sonar_file` | string | `""` | Optional path to a `.sonar` recording; enables file playback mode instead of live UDP |
+| `frame_id` | string | `sonar_link` | TF frame ID for published messages |
 | `chipid` | string | Hardware reported | Read-only sonar chip ID; empty if unavailable |
 | `firmware_version` | string | Hardware reported | Read-only firmware version; empty if unavailable |
 | `frame_id` | string | `sonar_link` | TF frame ID for point clouds |
@@ -116,6 +128,34 @@ explicit speed in m/s.
 not the actual speed used by the sonar. In default/auto mode it therefore
 returns `0.0`. The effective value for each received range image is available
 in the RIP `RangeImage.speed_of_sound` field.
+
+### Reading current device settings
+
+Use `~/get_device_settings` to query the sonar's current configuration over
+HTTP on demand. This uses the standard `rcl_interfaces/srv/GetParameters`
+service type and does not publish an extra topic or change ROS parameters.
+
+```bash
+ros2 service call /sonar_node/get_device_settings rcl_interfaces/srv/GetParameters \
+    "{names: [mode, speed_of_sound, range_min, range_max]}"
+```
+
+Supported names are `mode`, `speed_of_sound`, `range_min`, `range_max`,
+`salinity`, `acoustics_enabled`, and `imu_output_enabled`. Response values
+follow the requested order and use the standard `ParameterValue` fields:
+`type: 3` / `double_value` for numeric settings, `type: 4` / `string_value`
+for mode and salinity, and `type: 1` / `bool_value` for switches. Minimum and
+maximum range share one device query per request.
+
+`ros2 param get` continues to return the node's configured value; this service
+reads the device directly, including changes made through its web interface.
+The speed-of-sound getter returns the device's configured setting; the
+effective speed used for a frame is reported in the RIP packet.
+
+Unknown names, unsupported firmware features, and failed device reads return
+`type: 0` (`PARAMETER_NOT_SET`) for the affected entries and log the reason.
+During file playback or when disconnected, all requested values are unavailable
+(`type: 0`); startup defaults are not returned as device readings.
 
 ### Reading device identity
 
@@ -205,6 +245,17 @@ After building the package and sourcing your workspace, launch both nodes:
 ```bash
 ros2 launch waterlinked_sonar_3d15 sonar_with_imu_orientation.launch.py
 ```
+
+To estimate orientation while replaying a recording containing IMU packets:
+
+```bash
+ros2 launch waterlinked_sonar_3d15 sonar_with_imu_orientation.launch.py \
+    sonar_file:=/absolute/path/to/recording.sonar \
+    imu_output_enabled:=true
+```
+
+These arguments override the sonar YAML values when provided. File playback
+requires recorded IMU packets; enabling IMU output cannot add missing data.
 
 By default, the launch uses `config/default_params.yaml` for the sonar and
 `config/imu_filter_params.yaml` for the filter. Keep `imu_output_enabled: true`
